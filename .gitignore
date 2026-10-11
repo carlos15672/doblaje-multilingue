@@ -1,0 +1,26 @@
+# Entornos virtuales
+venv/
+.venv/
+.venv_asr/
+env/
+ENV/
+
+# Python cache y compilados
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Carpetas de datos temporales / salidas
+data_asr/
+runs_asr/
+output/
+tmp/
+*.log
+
+# Editores y sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

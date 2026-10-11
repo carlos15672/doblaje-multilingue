@@ -1,0 +1,35 @@
+1. Instala Python (si no lo tienes)
+    Ve a https://www.python.org/downloads/
+    Descarga e instala Python 3.8 o superior
+    Durante la instalación, marca la opción "Add Python to PATH".
+
+2. Crea una carpeta para tu proyecto
+    abre una terminal y ejecuta:
+    mkdir clasificador_vocales
+    cd clasificador_vocales
+
+3. Crea un entorno virtual
+    ejecuta el siguiente comando:
+    python -m venv venv
+
+    Activa el entorno:
+
+    Windows:
+    venv\Scripts\activate
+
+    Linux/macOS:
+    source venv/bin/activate
+
+4. Instala todas las dependencias
+    una vez activado el entorno ejecuta el siguiente comando:
+    pip install -r requirements.txt
+
+5. Una vez instalado todo ejecuta algun script para verificar que todo funiona 
+
+    python espectro_fft.py
+    o
+    python3 espectro_fft.py
+
+
+6. Ejecutacion de Front
+    streamlit run app_interfaz.pyz
