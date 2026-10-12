@@ -1,6 +1,7 @@
 import contextlib
 import csv
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,9 +10,10 @@ import numpy as np
 import torch
 
 from asr_es.audio import read_audio, write_wav
-from asr_es.data import Entry, SpeechDataset, audit_partitions, prepare_common_voice, read_manifest
+from asr_es.data import (Entry, SpeechDataset, audit_partitions, cache_features, cache_path,
+                         prepare_common_voice, read_manifest)
 from asr_es.engine import load_model, train, transcribe
-from asr_es.features import FeatureConfig, extract_features, radix2_rfft, resample
+from asr_es.features import FeatureConfig, _resample_direct, extract_features, radix2_rfft, resample
 from asr_es.metrics import error_rates
 from asr_es.model import CRNN, ModelConfig
 from asr_es.text import encode, greedy_decode, minimum_ctc_steps, normalize_text
@@ -30,6 +32,15 @@ class AcousticTests(unittest.TestCase):
         high = resample(np.sin(2 * np.pi * 10000 * t), 48000, 16000)[200:-200]
         self.assertGreater(np.sqrt(np.mean(low**2)), 0.65)
         self.assertLess(np.sqrt(np.mean(high**2)), 0.015)
+
+    def test_fast_resampling_matches_direct_reference(self):
+        # Pesos precalculados por fase frente al cálculo directo de cada salida, bordes incluidos.
+        rng = np.random.default_rng(3)
+        for rate in (48000, 44100, 32000, 22050, 8000):
+            for length in (1, 50, 300, 20000):
+                x = rng.normal(size=length)
+                outputs = np.arange(len(resample(x, rate, 16000)))
+                np.testing.assert_allclose(resample(x, rate, 16000), _resample_direct(x, rate, 16000, outputs), atol=1e-9)
 
     def test_features_preserve_temporal_changes(self):
         t = np.arange(16000) / 16000
@@ -96,6 +107,29 @@ class TextAndDataTests(unittest.TestCase):
             self.assertEqual(len(report["rechazos"]), 3)
             self.assertEqual(len(read_manifest(root / "manifests" / "train.csv")), 1)
 
+    def test_shared_cache_reports_unusable_recordings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            t = np.arange(8000) / 16000
+            write_wav(root / "voz.wav", 0.5 * np.sin(2 * np.pi * 300 * t))
+            write_wav(root / "silencio.wav", np.zeros(8000))
+            with (root / "train.csv").open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["audio", "text", "speaker"])
+                writer.writerow(["voz.wav", "hola", "uno"])
+                writer.writerow(["silencio.wav", "casa", "dos"])
+            for workers, cache in ((1, root / "cache_1"), (2, root / "cache_2")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    report = cache_features([root / "train.csv"], cache, workers=workers)
+                summary = report["manifiestos"][str((root / "train.csv").resolve())]
+                self.assertEqual((summary["grabaciones"], summary["excluidas"]), (2, 1))
+                usable = read_manifest(summary["utilizables"])
+                self.assertEqual([entry.text for entry in usable], ["hola"])
+                self.assertTrue(cache_path(usable[0], FeatureConfig(), cache).exists())
+                self.assertEqual(SpeechDataset(usable, FeatureConfig(), cache)[0][2], "hola")
+                for path in (summary["utilizables"], summary["excluidos"]):
+                    Path(path).unlink()
+
 
 class NetworkTests(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "No hay GPU CUDA")
@@ -155,6 +189,36 @@ class NetworkTests(unittest.TestCase):
             result = transcribe(result["checkpoint"], root / "dev0.wav", "cpu")
             self.assertIn("texto", result)
             self.assertEqual(result["estado"], "hipótesis del modelo")
+
+    def test_resume_continues_interrupted_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            t = np.arange(6400) / 16000
+            for split in ("train", "dev"):
+                with (root / f"{split}.csv").open("w", encoding="utf-8", newline="") as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(["audio", "text", "speaker"])
+                    for i, letter in enumerate(("a", "e")):
+                        write_wav(root / f"{split}{i}.wav", 0.5 * np.sin(2 * np.pi * (300 + 200 * i) * t))
+                        writer.writerow([f"{split}{i}.wav", letter, f"synthetic-{split}-{i}"])
+            options = dict(batch_size=2, hidden_size=8, device_name="cpu")
+            run = root / "run"
+            with contextlib.redirect_stdout(io.StringIO()):
+                train(root / "train.csv", root / "dev.csv", run, epochs=1, **options)
+                with self.assertRaises(ValueError):  # carpeta ocupada sin --resume
+                    train(root / "train.csv", root / "dev.csv", run, epochs=2, **options)
+                with self.assertRaises(ValueError):  # parámetros distintos a los originales
+                    train(root / "train.csv", root / "dev.csv", run, epochs=2, resume=True,
+                          batch_size=1, hidden_size=8, device_name="cpu")
+                train(root / "train.csv", root / "dev.csv", run, epochs=2, resume=True, **options)
+                best_epoch = torch.load(run / "best.pt", weights_only=True)["epoch"]
+                (run / "last.pt").unlink()  # corridas viejas: solo best.pt, sin optimizador
+                train(root / "train.csv", root / "dev.csv", run, epochs=3, resume=True, **options)
+            epochs = [json.loads(line)["epoch"] for line in (run / "history.jsonl").read_text().splitlines()]
+            self.assertEqual(epochs, [1, 2] + list(range(best_epoch + 1, 4)))
+            resumes = json.loads((run / "config.json").read_text(encoding="utf-8"))["reanudaciones"]
+            self.assertEqual([r["optimizador"] for r in resumes], ["restaurado", "nuevo"])
+            self.assertEqual(torch.load(run / "last.pt", weights_only=True)["epoch"], 3)
 
 
 if __name__ == "__main__":
