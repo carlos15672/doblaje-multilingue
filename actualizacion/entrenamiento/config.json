@@ -1,0 +1,55 @@
+{
+  "feature_config": {
+    "sample_rate": 16000,
+    "window_ms": 25,
+    "hop_ms": 10,
+    "n_fft": 512,
+    "n_mels": 40
+  },
+  "model_config": {
+    "n_mels": 40,
+    "conv_channels": 16,
+    "hidden_size": 128,
+    "recurrent_layers": 2,
+    "dropout": 0.1
+  },
+  "seed": 42,
+  "epochs": 15,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "device": "cuda",
+  "torch_version": "2.11.0+cu128",
+  "audit": {
+    "train": {
+      "grabaciones": 359382,
+      "hablantes": 5105
+    },
+    "dev": {
+      "grabaciones": 15840,
+      "hablantes": 3258
+    },
+    "coincidencias_textuales": [
+      {
+        "particiones": [
+          "train",
+          "dev"
+        ],
+        "textos_compartidos": 352
+      }
+    ]
+  },
+  "parameters": 549731,
+  "train_manifest": "data_asr\\manifiestos_completos\\train_utilizables.csv",
+  "dev_manifest": "data_asr\\manifiestos_completos\\dev.csv",
+  "feature_cache": "data_asr\\cache_features",
+  "data_workers": 8,
+  "pretrained_weights": false,
+  "reanudaciones": [
+    {
+      "desde": "best.pt",
+      "despues_de_epoca": 1,
+      "data_workers": 8,
+      "optimizador": "nuevo"
+    }
+  ]
+}
