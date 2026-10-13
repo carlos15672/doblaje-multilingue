@@ -29,67 +29,11 @@ class FeatureConfig:
             raise ValueError("Número de bandas Mel no válido")
 
 
-MAX_PHASES = 4096  # Fases distintas del filtro que vale la pena precalcular.
-# Bloques pequeños para que los datos temporales quepan en la caché del procesador:
-# con varios procesos en paralelo, los bloques grandes saturan la memoria compartida.
-# Medido con 8 procesos (Ryzen 9 5900HS): 8192 salidas/todas las ventanas -> 22 clips/s;
-# 256/32 -> 132 clips/s, con resultados idénticos.
-RESAMPLE_BLOCK = 256
-FRAME_BLOCK = 32
-
-
-def _filter_shape(source_rate, target_rate):
-    cutoff = 0.94 * min(1.0, target_rate / source_rate)
-    return cutoff, math.ceil(16 / cutoff)
-
-
-def _sinc_weights(delta, cutoff, radius):
-    window = np.where(np.abs(delta) <= radius, 0.5 + 0.5 * np.cos(np.pi * delta / radius), 0)
-    return cutoff * np.sinc(cutoff * delta) * window
-
-
-def _resample_direct(x, source_rate, target_rate, outputs):
-    """Algoritmo de referencia: calcula los pesos de cada salida pedida.
-
-    Se usa en los bordes (donde faltan muestras y los pesos se renormalizan),
-    con frecuencias que no forman una razón sencilla y en las pruebas.
-    """
-    cutoff, radius = _filter_shape(source_rate, target_rate)
-    offsets = np.arange(-radius, radius + 1)
-    result = np.empty(len(outputs))
-    for start in range(0, len(outputs), 2048):
-        positions = outputs[start:start + 2048] * source_rate / target_rate
-        indices = np.floor(positions).astype(np.int64)[:, None] + offsets
-        delta = positions[:, None] - indices
-        weights = _sinc_weights(delta, cutoff, radius)
-        valid = (indices >= 0) & (indices < len(x))
-        weights *= valid
-        weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
-        result[start:start + 2048] = (x[np.clip(indices, 0, len(x) - 1)] * weights).sum(axis=1)
-    return result
-
-
-@lru_cache(maxsize=16)
-def _phase_weights(source_rate, target_rate):
-    """Pesos normalizados por fase. Con razón up/down solo existen `up` desfases distintos
-    (48 kHz -> 16 kHz: uno solo), así que se calculan una vez y no en cada bloque."""
-    common = math.gcd(source_rate, target_rate)
-    up, down = target_rate // common, source_rate // common
-    cutoff, radius = _filter_shape(source_rate, target_rate)
-    positions = np.arange(up) * source_rate / target_rate
-    delta = (positions - np.floor(positions))[:, None] - np.arange(-radius, radius + 1)
-    weights = _sinc_weights(delta, cutoff, radius)
-    weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
-    weights.setflags(write=False)
-    return up, down, radius, weights
-
-
 def resample(samples, source_rate, target_rate):
     """Interpolación sinc con filtro paso bajo y ventana de Hann.
 
     Al reducir frecuencia, el corte se reduce ANTES del submuestreo para evitar
-    aliasing. En el interior del audio se usan pesos precalculados por fase; en los
-    bordes, el cálculo directo. Ambos dan el mismo resultado (ver pruebas).
+    aliasing. Se procesa por bloques para no construir una matriz de todo el audio.
     """
     x = np.asarray(samples, dtype=np.float64)
     if x.ndim != 1 or not len(x) or not np.isfinite(x).all():
@@ -98,24 +42,21 @@ def resample(samples, source_rate, target_rate):
         raise ValueError("Frecuencia de muestreo no válida")
     if source_rate == target_rate:
         return x.copy()
-    outputs = np.arange(math.ceil(len(x) * target_rate / source_rate))
-    if source_rate != int(source_rate) or target_rate != int(target_rate):
-        return _resample_direct(x, source_rate, target_rate, outputs)
-    up, down, radius, weights = _phase_weights(int(source_rate), int(target_rate))
-    if up > MAX_PHASES or len(x) < 2 * radius + 1:
-        return _resample_direct(x, source_rate, target_rate, outputs)
-    result = np.empty(len(outputs))
-    floors = outputs * down // up
-    interior = (floors >= radius) & (floors + radius < len(x))
-    windows = np.lib.stride_tricks.sliding_window_view(x, 2 * radius + 1)
-    selected = np.flatnonzero(interior)
-    for start in range(0, len(selected), RESAMPLE_BLOCK):
-        chunk = selected[start:start + RESAMPLE_BLOCK]
-        block = windows[floors[chunk] - radius]
-        result[chunk] = block @ weights[0] if up == 1 else np.einsum("ij,ij->i", block, weights[chunk % up])
-    edges = np.flatnonzero(~interior)
-    if len(edges):
-        result[edges] = _resample_direct(x, source_rate, target_rate, edges)
+    cutoff = 0.94 * min(1.0, target_rate / source_rate)
+    radius = math.ceil(16 / cutoff)
+    offsets = np.arange(-radius, radius + 1)
+    result = np.empty(math.ceil(len(x) * target_rate / source_rate))
+    for start in range(0, len(result), 2048):
+        stop = min(start + 2048, len(result))
+        positions = np.arange(start, stop) * source_rate / target_rate
+        indices = np.floor(positions).astype(np.int64)[:, None] + offsets
+        delta = positions[:, None] - indices
+        window = np.where(np.abs(delta) <= radius, 0.5 + 0.5 * np.cos(np.pi * delta / radius), 0)
+        weights = cutoff * np.sinc(cutoff * delta) * window
+        valid = (indices >= 0) & (indices < len(x))
+        weights *= valid
+        weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
+        result[start:stop] = (x[np.clip(indices, 0, len(x) - 1)] * weights).sum(axis=1)
     return result
 
 
@@ -176,14 +117,9 @@ def extract_features(samples, rate, config=FeatureConfig()):
     padded = np.pad(x, (0, (count - 1) * hop + win - len(x)))
     frames = np.lib.stride_tricks.sliding_window_view(padded, win)[::hop]
     window = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(win) / (win - 1))
-    bank = mel_filters(config).T
-    energies = np.empty((len(frames), config.n_mels))
-    # Cada ventana es independiente: procesarlas por bloques da el mismo resultado.
-    for start in range(0, len(frames), FRAME_BLOCK):
-        spectrum = radix2_rfft(frames[start:start + FRAME_BLOCK] * window, config.n_fft)
-        power = np.abs(spectrum) ** 2 / config.n_fft
-        energies[start:start + FRAME_BLOCK] = power @ bank
-    features = np.log(np.maximum(energies, 1e-10))
+    spectrum = radix2_rfft(frames * window, config.n_fft)
+    power = np.abs(spectrum) ** 2 / config.n_fft
+    features = np.log(np.maximum(power @ mel_filters(config).T, 1e-10))
     # Media/desviación globales de ESTA grabación; no se utilizan datos de prueba.
     features = (features - features.mean()) / max(float(features.std()), 1e-5)
     return features.astype(np.float32)

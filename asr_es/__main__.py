@@ -2,7 +2,6 @@
 import argparse
 from dataclasses import asdict
 import json
-import os
 from pathlib import Path
 import sys
 
@@ -27,10 +26,6 @@ def main():
     prepare.add_argument("root", nargs="+", help="Una o más carpetas con clips/ y train.tsv, dev.tsv, test.tsv")
     prepare.add_argument("--output", required=True)
     prepare.add_argument("--limit", type=int, help="Máximo de ejemplos por partición para desarrollo")
-    caching = commands.add_parser("cache-features", help="Calcular en paralelo las características de manifiestos en una caché compartida")
-    caching.add_argument("manifests", nargs="+", help="Uno o más CSV audio,text,speaker")
-    caching.add_argument("--cache", required=True, help="Carpeta de caché compartida entre entrenamientos")
-    caching.add_argument("--workers", type=int, default=0, help="Procesos en paralelo; 0 = la mitad de los núcleos lógicos")
     audit = commands.add_parser("audit", help="Verificar formato y separación de archivos y hablantes")
     audit.add_argument("--train", required=True)
     audit.add_argument("--dev", required=True)
@@ -45,12 +40,6 @@ def main():
     training.add_argument("--hidden-size", type=int, default=128)
     training.add_argument("--seed", type=int, default=42)
     training.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    training.add_argument("--cache", help="Caché de características creada con cache-features")
-    training.add_argument("--workers", type=int,
-                          help="Procesos que leen datos en paralelo; 0 = en el proceso principal. "
-                               "Por defecto, la mitad de los núcleos lógicos (máximo 8)")
-    training.add_argument("--resume", action="store_true",
-                          help="Continuar una corrida interrumpida en la misma --output con los mismos parámetros")
     recognition = commands.add_parser("transcribe", help="Transcribir con un checkpoint propio previamente entrenado")
     recognition.add_argument("audio")
     recognition.add_argument("--checkpoint", required=True)
@@ -62,7 +51,6 @@ def main():
     evaluation.add_argument("--test", required=True)
     evaluation.add_argument("--output", required=True, help="Archivo JSON nuevo para métricas y predicciones")
     evaluation.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    evaluation.add_argument("--cache", help="Caché de características creada con cache-features")
     args = parser.parse_args()
     if args.command == "diagnose":
         import torch
@@ -93,17 +81,13 @@ def main():
             np.savez_compressed(args.output, features=features, metadata=json.dumps(result, ensure_ascii=False))
     elif args.command == "prepare-cv":
         result = prepare_common_voice(args.root, args.output, args.limit)
-    elif args.command == "cache-features":
-        from .data import cache_features
-        result = cache_features(args.manifests, args.cache, workers=args.workers)
     elif args.command == "audit":
         partitions = {name: read_manifest(getattr(args, name)) for name in ("train", "dev", "test") if getattr(args, name)}
         result = audit_partitions(partitions)
     elif args.command == "train":
         from .engine import train
-        workers = args.workers if args.workers is not None else min(8, max(1, (os.cpu_count() or 2) // 2))
         result = train(args.train, args.dev, args.output, args.epochs, args.batch_size, args.learning_rate,
-                       args.device, args.seed, args.hidden_size, args.cache, workers, args.resume)
+                       args.device, args.seed, args.hidden_size)
     elif args.command == "transcribe":
         from .engine import transcribe
         result = transcribe(args.checkpoint, args.audio, args.device)
@@ -112,7 +96,7 @@ def main():
         output = Path(args.output)
         if output.exists():
             raise ValueError("Usa un archivo de evaluación nuevo")
-        result = test_checkpoint(args.checkpoint, args.test, args.train, args.dev, args.device, args.cache)
+        result = test_checkpoint(args.checkpoint, args.test, args.train, args.dev, args.device)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         result = {"metricas": result["metrics"], "resultados": str(output.resolve())}
