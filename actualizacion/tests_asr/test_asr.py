@@ -2,6 +2,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,13 +11,16 @@ import numpy as np
 import torch
 
 from asr_es.audio import read_audio, write_wav
+from asr_es.augment import AugmentConfig, augment_audio, mask_features
 from asr_es.data import (Entry, SpeechDataset, audit_partitions, cache_features, cache_path,
                          prepare_common_voice, read_manifest)
-from asr_es.engine import load_model, train, transcribe
+from asr_es.decoding import DecoderPool, NGramLanguageModel, forced_align_words, prefix_beam_search
+from asr_es.engine import load_model, train, transcribe, tune_decoder
 from asr_es.features import FeatureConfig, _resample_direct, extract_features, radix2_rfft, resample
 from asr_es.metrics import error_rates
 from asr_es.model import CRNN, ModelConfig
 from asr_es.text import encode, greedy_decode, minimum_ctc_steps, normalize_text
+from asr_es.vad import VADConfig, detect_speech
 
 torch.set_num_threads(2)
 
@@ -67,6 +71,29 @@ class AcousticTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 write_wav(path, samples)
 
+    def test_vad_rejects_silence_and_segments_long_speech(self):
+        rate = 16000
+        silence, diagnostics = detect_speech(np.zeros(rate), rate)
+        self.assertEqual(silence, [])
+        self.assertEqual(diagnostics["speech_ratio"], 0)
+        t = np.arange(2 * rate) / rate
+        audio = 0.5 * np.sin(2 * np.pi * 220 * t)
+        config = VADConfig(max_segment_seconds=0.8, overlap_seconds=0.2)
+        segments, _ = detect_speech(audio, rate, config)
+        self.assertGreaterEqual(len(segments), 3)
+        self.assertTrue(all((s.end_sample - s.start_sample) / rate <= 0.8 for s in segments))
+
+    def test_augmentations_are_reproducible_and_preserve_shape_contract(self):
+        x = np.sin(2 * np.pi * 200 * np.arange(16000) / 16000)
+        config = AugmentConfig(probability=1, speed_probability=0, noise_probability=1)
+        first = augment_audio(x, 16000, np.random.default_rng(9), config)
+        second = augment_audio(x, 16000, np.random.default_rng(9), config)
+        np.testing.assert_array_equal(first, second)
+        features = np.ones((50, 40), dtype=np.float32)
+        masked = mask_features(features, np.random.default_rng(5), config)
+        self.assertEqual(masked.shape, features.shape)
+        self.assertTrue(np.any(masked == 0))
+
 
 class TextAndDataTests(unittest.TestCase):
     def test_ctc_repetitions_keep_blank_separation(self):
@@ -107,6 +134,38 @@ class TextAndDataTests(unittest.TestCase):
             self.assertEqual(len(report["rechazos"]), 3)
             self.assertEqual(len(read_manifest(root / "manifests" / "train.csv")), 1)
 
+    def test_common_voice_import_accepts_separate_tsv_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clips = root / "audio" / "clips"
+            metadata = root / "metadata"
+            clips.mkdir(parents=True)
+            metadata.mkdir()
+            split_files = {}
+            for split in ("train", "dev", "test"):
+                (clips / f"{split}.wav").touch()
+                tsv = metadata / f"{split}.tsv"
+                split_files[split] = tsv
+                with tsv.open("w", encoding="utf-8", newline="") as stream:
+                    writer = csv.writer(stream, delimiter="\t")
+                    writer.writerow(["path", "sentence", "client_id", "accents"])
+                    writer.writerow([f"{split}.wav", "¡Hola!", split, "México"])
+            report = prepare_common_voice(None, root / "manifests", split_files=split_files, clips=clips)
+            self.assertEqual(report["train"]["grabaciones"], 1)
+            imported = read_manifest(root / "manifests" / "train.csv")[0]
+            self.assertEqual((imported.text, imported.accent), ("hola", "México"))
+
+    def test_common_voice_import_requires_audio_for_separate_tsv_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            split_files = {}
+            for split in ("train", "dev", "test"):
+                tsv = root / f"{split}.tsv"
+                tsv.write_text("path\tsentence\tclient_id\na.wav\thola\tpersona\n", encoding="utf-8")
+                split_files[split] = tsv
+            with self.assertRaisesRegex(ValueError, "No existe la carpeta de audio"):
+                prepare_common_voice(None, root / "manifests", split_files=split_files, clips=root / "clips")
+
     def test_shared_cache_reports_unusable_recordings(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -129,6 +188,61 @@ class TextAndDataTests(unittest.TestCase):
                 self.assertEqual(SpeechDataset(usable, FeatureConfig(), cache)[0][2], "hola")
                 for path in (summary["utilizables"], summary["excluidos"]):
                     Path(path).unlink()
+
+    def test_prefix_beam_search_ngram_and_word_timestamps(self):
+        a, space, b = encode("a b")
+        classes = len(" abcdefghijklmnñopqrstuvwxyzáéíóúü") + 1
+        path = [0, a, 0, space, 0, b, 0]
+        probabilities = np.full((len(path), classes), -12.0)
+        for frame, token in enumerate(path):
+            probabilities[frame, token] = -0.01
+        result = prefix_beam_search(probabilities, beam_width=4)
+        self.assertEqual(result[0]["texto"], "a b")
+        words = forced_align_words(probabilities, "a b")
+        self.assertEqual([item["texto"] for item in words], ["a", "b"])
+        model = NGramLanguageModel.train(["a b", "a b", "a casa"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lm.json"
+            model.save(path)
+            restored = NGramLanguageModel.load(path)
+            self.assertGreater(restored.score("a b", final=True), restored.score("b a", final=True))
+
+    def test_kneser_ney_is_a_distribution_and_loads_from_add_k_counts(self):
+        texts = ["el río cruza la ciudad", "la ciudad es grande", "el río es largo", "de norte a sur"]
+        kneser = NGramLanguageModel.train(texts, smoothing="kneser-ney")
+        add_k = NGramLanguageModel.train(texts)
+        vocabulary = sorted(kneser.vocabulary)
+        for model in (kneser, add_k):
+            for context in (["el"], ["ciudad"], ["inexistente"]):  # vistos y no visto
+                total = sum(math.exp(model._word_score(context, word)) for word in vocabulary)
+                self.assertAlmostEqual(total, 1.0, places=9)
+        # Kneser-Ney prefiere la continuación vista y castiga menos que add-k a una palabra rara.
+        self.assertGreater(kneser._word_score(["la"], "ciudad"), kneser._word_score(["la"], "río"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lm.json"
+            add_k.save(path)
+            converted = NGramLanguageModel.load(path, smoothing="kneser-ney")
+            self.assertAlmostEqual(converted.score("el río es grande", final=True),
+                                   kneser.score("el río es grande", final=True), places=12)
+        with self.assertRaises(ValueError):
+            NGramLanguageModel.train(texts, order=3, smoothing="kneser-ney")
+
+    def test_word_bonus_and_parallel_decoding(self):
+        a, space, b = encode("a b")
+        classes = len(" abcdefghijklmnñopqrstuvwxyzáéíóúü") + 1
+        probabilities = np.full((3, classes), -12.0)
+        probabilities[0, a], probabilities[2, b] = -0.01, -0.01
+        probabilities[1, 0], probabilities[1, space] = -0.6, -0.8  # el espacio es algo menos probable
+        self.assertEqual(prefix_beam_search(probabilities, beam_width=4)[0]["texto"], "ab")
+        self.assertEqual(prefix_beam_search(probabilities, beam_width=4, word_bonus=1.0)[0]["texto"], "a b")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lm.json"
+            NGramLanguageModel.train(["a b", "a casa"]).save(path)
+            arrays = [probabilities, probabilities[::-1].copy(), probabilities]
+            with DecoderPool(str(path), "kneser-ney", workers=1) as pool:
+                sequential = pool.decode(arrays, 4, 0.2, 1.0)
+            with DecoderPool(str(path), "kneser-ney", workers=2) as pool:
+                self.assertEqual(pool.decode(arrays, 4, 0.2, 1.0), sequential)
 
 
 class NetworkTests(unittest.TestCase):
@@ -183,12 +297,26 @@ class NetworkTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 result = train(root / "train.csv", root / "dev.csv", root / "run", epochs=1,
                                batch_size=2, hidden_size=8, device_name="cpu")
-            model, config, _ = load_model(result["checkpoint"], "cpu")
+            checkpoint = result["checkpoint"]
+            model, config, _ = load_model(checkpoint, "cpu")
             self.assertEqual(config.sample_rate, 16000)
             self.assertEqual(model.config.hidden_size, 8)
-            result = transcribe(result["checkpoint"], root / "dev0.wav", "cpu")
+            result = transcribe(checkpoint, root / "dev0.wav", "cpu")
             self.assertIn("texto", result)
-            self.assertEqual(result["estado"], "hipótesis del modelo")
+            self.assertIn(result["estado"], ("hipótesis del modelo", "voz rechazada por baja confianza"))
+            self.assertTrue(result["segmentos"])
+            self.assertIn("confianza", result)
+            # Ajuste del decodificador: greedy + beam + 2 suavizados x 1 peso x 2 premios.
+            NGramLanguageModel.train(["a", "e", "a e"]).save(root / "lm.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                tuned = tune_decoder(checkpoint, root / "dev.csv", root / "lm.json", root / "ajuste.json",
+                                     clips=2, lm_weights=(0.1,), word_bonuses=(0.0, 1.0),
+                                     beam_width=4, workers=1, device_name="cpu")
+            report = json.loads((root / "ajuste.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(report["resultados"]), 6)
+            self.assertIn(tuned["mejor"], report["resultados"])
+            with self.assertRaises(ValueError):
+                tune_decoder(checkpoint, root / "dev.csv", root / "lm.json", root / "ajuste.json", clips=2)
 
     def test_resume_continues_interrupted_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -212,6 +340,13 @@ class NetworkTests(unittest.TestCase):
                           batch_size=1, hidden_size=8, device_name="cpu")
                 train(root / "train.csv", root / "dev.csv", run, epochs=2, resume=True, **options)
                 best_epoch = torch.load(run / "best.pt", weights_only=True)["epoch"]
+                warm = root / "warm"
+                train(root / "train.csv", root / "dev.csv", warm, epochs=1,
+                      init_checkpoint=run / "best.pt", **options)
+                warm_config = json.loads((warm / "config.json").read_text(encoding="utf-8"))
+                self.assertTrue(warm_config["pretrained_weights"])
+                self.assertEqual(warm_config["initial_checkpoint"]["path"], str((run / "best.pt").resolve()))
+                self.assertEqual(torch.load(warm / "best.pt", weights_only=True)["epoch"], 1)
                 (run / "last.pt").unlink()  # corridas viejas: solo best.pt, sin optimizador
                 train(root / "train.csv", root / "dev.csv", run, epochs=3, resume=True, **options)
             epochs = [json.loads(line)["epoch"] for line in (run / "history.jsonl").read_text().splitlines()]

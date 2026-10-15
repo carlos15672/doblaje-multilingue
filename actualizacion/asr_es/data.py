@@ -21,6 +21,9 @@ class Entry:
     audio: Path
     text: str
     speaker: str
+    accent: str = "desconocido"
+    environment: str = "desconocido"
+    microphone: str = "desconocido"
 
 
 def read_manifest(path):
@@ -43,7 +46,10 @@ def read_manifest(path):
             except ValueError as error:
                 raise ValueError(f"{path}:{line}: {error}") from error
             paths.add(audio)
-            entries.append(Entry(audio, text, row["speaker"].strip()))
+            entries.append(Entry(audio, text, row["speaker"].strip(),
+                                 (row.get("accent") or "desconocido").strip(),
+                                 (row.get("environment") or "desconocido").strip(),
+                                 (row.get("microphone") or "desconocido").strip()))
     if not entries:
         raise ValueError(f"Manifiesto vacío: {path}")
     return entries
@@ -102,18 +108,33 @@ def load_features(entry, config, cache=None):
 
 
 class SpeechDataset:
-    def __init__(self, entries, config=FeatureConfig(), cache=None):
+    def __init__(self, entries, config=FeatureConfig(), cache=None, augmentation=None, seed=42):
         self.entries, self.config = entries, config
         self.cache = Path(cache) if cache else None
+        self.augmentation, self.seed, self.epoch = augmentation, seed, 0
         if self.cache:
             self.cache.mkdir(parents=True, exist_ok=True)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
 
     def __len__(self):
         return len(self.entries)
 
     def __getitem__(self, index):
         entry = self.entries[index]
-        features, tokens = load_features(entry, self.config, self.cache)
+        if self.augmentation is None:
+            features, tokens = load_features(entry, self.config, self.cache)
+        else:
+            from .augment import augment_audio, mask_features
+            key = f"{entry.audio}|{self.seed}|{self.epoch}".encode()
+            rng = np.random.default_rng(int.from_bytes(hashlib.sha256(key).digest()[:8], "little"))
+            audio, rate = read_audio(entry.audio)
+            audio = augment_audio(audio, rate, rng, self.augmentation)
+            features = mask_features(extract_features(audio, rate, self.config), rng, self.augmentation)
+            tokens = encode(entry.text)
+            if (len(features) + 1) // 2 < minimum_ctc_steps(tokens):
+                raise ValueError(f"{entry.audio}: aumento produjo audio demasiado corto para CTC")
         return features, tokens, entry.text
 
 
@@ -168,8 +189,9 @@ def cache_features(manifests, cache, config=FeatureConfig(), workers=0):
                 bad = {entry.audio for entry, _ in errors}
                 with usable.open("w", encoding="utf-8", newline="") as target:
                     writer = csv.writer(target)
-                    writer.writerow(["audio", "text", "speaker"])
-                    writer.writerows((str(e.audio), e.text, e.speaker) for e in entries if e.audio not in bad)
+                    writer.writerow(["audio", "text", "speaker", "accent", "environment", "microphone"])
+                    writer.writerows((str(e.audio), e.text, e.speaker, e.accent, e.environment, e.microphone)
+                                     for e in entries if e.audio not in bad)
                 with excluded.open("w", encoding="utf-8", newline="") as target:
                     writer = csv.writer(target)
                     writer.writerow(["audio", "text", "speaker", "motivo"])
@@ -194,10 +216,53 @@ def collate(samples):
     return features, lengths, targets, target_lengths, [text for _, _, text in samples]
 
 
-def prepare_common_voice(root, output, limit=None):
-    """Importa particiones oficiales, sin descargar ni generar transcripciones."""
-    roots = root if isinstance(root, (list, tuple)) else [root]
+def _common_voice_sources(root=None, split_files=None, clips=None):
+    """Resuelve corpus completos o TSV separados hacia pares (tsv, clips)."""
+    roots = [] if root is None else (root if isinstance(root, (list, tuple)) else [root])
     roots = [Path(item).resolve() for item in roots]
+    explicit = split_files is not None or clips is not None
+    if roots and explicit:
+        raise ValueError("Usa carpetas de corpus o --train-tsv/--dev-tsv/--test-tsv con --clips, no ambos")
+    if not roots and not explicit:
+        raise ValueError("Indica una carpeta de corpus o los tres TSV y la carpeta clips")
+    if explicit:
+        split_files = split_files or {}
+        missing = [split for split in ("train", "dev", "test") if not split_files.get(split)]
+        if missing or clips is None:
+            details = ", ".join(f"--{split}-tsv" for split in missing)
+            if clips is None:
+                details = f"{details}, --clips" if details else "--clips"
+            raise ValueError(f"Faltan argumentos de Common Voice: {details}")
+        clips = Path(clips).resolve()
+        if not clips.is_dir():
+            raise ValueError(f"No existe la carpeta de audio de Common Voice: {clips}")
+        sources = {}
+        for split in ("train", "dev", "test"):
+            tsv = Path(split_files[split]).resolve()
+            if not tsv.is_file():
+                raise ValueError(f"No existe el TSV de {split}: {tsv}")
+            sources[split] = [(tsv, clips, str(tsv))]
+        return sources
+    sources = {split: [] for split in ("train", "dev", "test")}
+    for corpus_root in roots:
+        clips_root = (corpus_root / "clips").resolve()
+        if not clips_root.is_dir():
+            raise ValueError(f"No existe la carpeta de audio de Common Voice: {clips_root}")
+        for split in sources:
+            tsv = (corpus_root / f"{split}.tsv").resolve()
+            if not tsv.is_file():
+                raise ValueError(f"No existe el TSV de {split}: {tsv}")
+            sources[split].append((tsv, clips_root, str(corpus_root)))
+    return sources
+
+
+def prepare_common_voice(root, output, limit=None, split_files=None, clips=None):
+    """Importa particiones oficiales, sin descargar ni generar transcripciones.
+
+    ``root`` conserva el formato clásico (carpeta con ``clips/`` y los tres TSV).
+    ``split_files`` + ``clips`` permite usar TSV descargados o adjuntos por separado.
+    """
+    sources = _common_voice_sources(root, split_files, clips)
     output = Path(output).resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError("Usa una carpeta de manifiestos nueva para no sobrescribir datos")
@@ -207,26 +272,26 @@ def prepare_common_voice(root, output, limit=None):
     for split in ("train", "dev", "test"):
         entries = []
         filenames = set()
-        for root in roots:
-            path = root / f"{split}.tsv"
+        for path, clips_root, origin in sources[split]:
             with path.open(encoding="utf-8-sig", newline="") as source:
                 reader = csv.DictReader(source, delimiter="\t")
                 if not {"path", "sentence", "client_id"}.issubset(reader.fieldnames or []):
                     raise ValueError(f"{path}: formato Common Voice no reconocido")
                 for line, row in enumerate(reader, 2):
-                    audio = (root / "clips" / row["path"]).resolve()
+                    audio = (clips_root / row["path"]).resolve()
                     try:
-                        audio.relative_to(root / "clips")
+                        audio.relative_to(clips_root)
                         text = normalize_text(row["sentence"])
                         speaker = row["client_id"].strip()
+                        accent = (row.get("accents") or row.get("accent") or "desconocido").strip()
                         if not speaker or not audio.is_file():
                             raise ValueError("Falta archivo de audio o identificador del hablante")
                         if audio.name in filenames:
                             raise ValueError("Archivo Common Voice duplicado entre fuentes; no mezclar versiones del mismo corpus")
                         filenames.add(audio.name)
-                        entries.append(Entry(audio, text, speaker))
+                        entries.append(Entry(audio, text, speaker, accent))
                     except ValueError as error:
-                        rejected.append({"origen": str(root), "particion": split, "linea": line, "motivo": str(error)})
+                        rejected.append({"origen": origin, "particion": split, "linea": line, "motivo": str(error)})
         if not entries:
             raise ValueError(f"No hay grabaciones utilizables en la partición {split}")
         partitions[split] = entries
@@ -243,7 +308,8 @@ def prepare_common_voice(root, output, limit=None):
     for split, entries in partitions.items():
         with (output / f"{split}.csv").open("w", encoding="utf-8", newline="") as target:
             writer = csv.writer(target)
-            writer.writerow(["audio", "text", "speaker"])
-            writer.writerows((str(e.audio), e.text, e.speaker) for e in entries)
+            writer.writerow(["audio", "text", "speaker", "accent", "environment", "microphone"])
+            writer.writerows((str(e.audio), e.text, e.speaker, e.accent, e.environment, e.microphone)
+                             for e in entries)
     (output / "importacion.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
