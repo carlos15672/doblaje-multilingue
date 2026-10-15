@@ -16,6 +16,12 @@ class ModelConfig:
     recurrent_layers: int = 2
     dropout: float = 0.1
 
+    def __post_init__(self):
+        if self.n_mels < 4 or self.conv_channels < 2:
+            raise ValueError("Configuración convolucional no válida")
+        if self.hidden_size < 4 or self.recurrent_layers < 1 or not 0 <= self.dropout < 1:
+            raise ValueError("Configuración recurrente no válida")
+
 
 class CRNN(nn.Module):
     def __init__(self, config=ModelConfig()):
