@@ -2,6 +2,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,8 +14,8 @@ from asr_es.audio import read_audio, write_wav
 from asr_es.augment import AugmentConfig, augment_audio, mask_features
 from asr_es.data import (Entry, SpeechDataset, audit_partitions, cache_features, cache_path,
                          prepare_common_voice, read_manifest)
-from asr_es.decoding import NGramLanguageModel, forced_align_words, prefix_beam_search
-from asr_es.engine import load_model, train, transcribe
+from asr_es.decoding import DecoderPool, NGramLanguageModel, forced_align_words, prefix_beam_search
+from asr_es.engine import load_model, train, transcribe, tune_decoder
 from asr_es.features import FeatureConfig, _resample_direct, extract_features, radix2_rfft, resample
 from asr_es.metrics import error_rates
 from asr_es.model import CRNN, ModelConfig
@@ -206,6 +207,43 @@ class TextAndDataTests(unittest.TestCase):
             restored = NGramLanguageModel.load(path)
             self.assertGreater(restored.score("a b", final=True), restored.score("b a", final=True))
 
+    def test_kneser_ney_is_a_distribution_and_loads_from_add_k_counts(self):
+        texts = ["el río cruza la ciudad", "la ciudad es grande", "el río es largo", "de norte a sur"]
+        kneser = NGramLanguageModel.train(texts, smoothing="kneser-ney")
+        add_k = NGramLanguageModel.train(texts)
+        vocabulary = sorted(kneser.vocabulary)
+        for model in (kneser, add_k):
+            for context in (["el"], ["ciudad"], ["inexistente"]):  # vistos y no visto
+                total = sum(math.exp(model._word_score(context, word)) for word in vocabulary)
+                self.assertAlmostEqual(total, 1.0, places=9)
+        # Kneser-Ney prefiere la continuación vista y castiga menos que add-k a una palabra rara.
+        self.assertGreater(kneser._word_score(["la"], "ciudad"), kneser._word_score(["la"], "río"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lm.json"
+            add_k.save(path)
+            converted = NGramLanguageModel.load(path, smoothing="kneser-ney")
+            self.assertAlmostEqual(converted.score("el río es grande", final=True),
+                                   kneser.score("el río es grande", final=True), places=12)
+        with self.assertRaises(ValueError):
+            NGramLanguageModel.train(texts, order=3, smoothing="kneser-ney")
+
+    def test_word_bonus_and_parallel_decoding(self):
+        a, space, b = encode("a b")
+        classes = len(" abcdefghijklmnñopqrstuvwxyzáéíóúü") + 1
+        probabilities = np.full((3, classes), -12.0)
+        probabilities[0, a], probabilities[2, b] = -0.01, -0.01
+        probabilities[1, 0], probabilities[1, space] = -0.6, -0.8  # el espacio es algo menos probable
+        self.assertEqual(prefix_beam_search(probabilities, beam_width=4)[0]["texto"], "ab")
+        self.assertEqual(prefix_beam_search(probabilities, beam_width=4, word_bonus=1.0)[0]["texto"], "a b")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lm.json"
+            NGramLanguageModel.train(["a b", "a casa"]).save(path)
+            arrays = [probabilities, probabilities[::-1].copy(), probabilities]
+            with DecoderPool(str(path), "kneser-ney", workers=1) as pool:
+                sequential = pool.decode(arrays, 4, 0.2, 1.0)
+            with DecoderPool(str(path), "kneser-ney", workers=2) as pool:
+                self.assertEqual(pool.decode(arrays, 4, 0.2, 1.0), sequential)
+
 
 class NetworkTests(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "No hay GPU CUDA")
@@ -259,14 +297,26 @@ class NetworkTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 result = train(root / "train.csv", root / "dev.csv", root / "run", epochs=1,
                                batch_size=2, hidden_size=8, device_name="cpu")
-            model, config, _ = load_model(result["checkpoint"], "cpu")
+            checkpoint = result["checkpoint"]
+            model, config, _ = load_model(checkpoint, "cpu")
             self.assertEqual(config.sample_rate, 16000)
             self.assertEqual(model.config.hidden_size, 8)
-            result = transcribe(result["checkpoint"], root / "dev0.wav", "cpu")
+            result = transcribe(checkpoint, root / "dev0.wav", "cpu")
             self.assertIn("texto", result)
             self.assertIn(result["estado"], ("hipótesis del modelo", "voz rechazada por baja confianza"))
             self.assertTrue(result["segmentos"])
             self.assertIn("confianza", result)
+            # Ajuste del decodificador: greedy + beam + 2 suavizados x 1 peso x 2 premios.
+            NGramLanguageModel.train(["a", "e", "a e"]).save(root / "lm.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                tuned = tune_decoder(checkpoint, root / "dev.csv", root / "lm.json", root / "ajuste.json",
+                                     clips=2, lm_weights=(0.1,), word_bonuses=(0.0, 1.0),
+                                     beam_width=4, workers=1, device_name="cpu")
+            report = json.loads((root / "ajuste.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(report["resultados"]), 6)
+            self.assertIn(tuned["mejor"], report["resultados"])
+            with self.assertRaises(ValueError):
+                tune_decoder(checkpoint, root / "dev.csv", root / "lm.json", root / "ajuste.json", clips=2)
 
     def test_resume_continues_interrupted_run(self):
         with tempfile.TemporaryDirectory() as directory:

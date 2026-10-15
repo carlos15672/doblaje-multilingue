@@ -39,6 +39,22 @@ def main():
     language.add_argument("manifests", nargs="+", help="CSV cuyos textos se usarán, normalmente solo train")
     language.add_argument("--output", required=True)
     language.add_argument("--order", type=int, default=2)
+    language.add_argument("--smoothing", choices=["add-k", "kneser-ney"], default="kneser-ney",
+                          help="Suavizado; kneser-ney requiere --order 2")
+    tuning = commands.add_parser("tune-decoder", help="Elegir peso del LM, premio por palabra y suavizado con dev")
+    tuning.add_argument("--checkpoint", required=True)
+    tuning.add_argument("--dev", required=True, help="Manifiesto de validación (nunca test)")
+    tuning.add_argument("--lm", required=True, help="Modelo n-gram creado con build-lm")
+    tuning.add_argument("--output", required=True, help="Archivo JSON nuevo con todos los resultados")
+    tuning.add_argument("--cache", help="Caché de características creada con cache-features")
+    tuning.add_argument("--clips", type=int, default=300, help="Clips de dev, muestra fija según --seed")
+    tuning.add_argument("--seed", type=int, default=13)
+    tuning.add_argument("--lm-weights", default="0.1,0.2,0.3,0.5")
+    tuning.add_argument("--word-bonuses", default="0,1,2,3")
+    tuning.add_argument("--smoothings", default="add-k,kneser-ney")
+    tuning.add_argument("--beam-width", type=int, default=16)
+    tuning.add_argument("--workers", type=int, default=0, help="Procesos de decodificación; 0 = la mitad de los núcleos")
+    tuning.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     audit = commands.add_parser("audit", help="Verificar formato y separación de archivos y hablantes")
     audit.add_argument("--train", required=True)
     audit.add_argument("--dev", required=True)
@@ -69,7 +85,12 @@ def main():
     recognition.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     recognition.add_argument("--beam-width", type=int, default=16, help="1 = greedy; valores mayores usan prefix beam search")
     recognition.add_argument("--lm", help="Modelo n-gram creado con build-lm")
-    recognition.add_argument("--lm-weight", type=float, default=0.25)
+    # Valores elegidos con tune-decoder en dev (Kneser-Ney: 300 + 1000 clips): peso 0.2, premio 1.
+    recognition.add_argument("--lm-weight", type=float, default=0.2)
+    recognition.add_argument("--word-bonus", type=float,
+                             help="Premio por palabra; compensa que el LM castigue cada palabra nueva. "
+                                  "Por defecto 1 con --lm y 0 sin modelo de lenguaje")
+    recognition.add_argument("--lm-smoothing", choices=["add-k", "kneser-ney"], help="Usar los conteos del LM con otro suavizado")
     recognition.add_argument("--min-confidence", type=float, default=0.15)
     recognition.add_argument("--max-segment-seconds", type=float, default=25.0)
     recognition.add_argument("--overlap-seconds", type=float, default=0.4)
@@ -83,8 +104,13 @@ def main():
     evaluation.add_argument("--cache", help="Caché de características creada con cache-features")
     evaluation.add_argument("--beam-width", type=int, default=1)
     evaluation.add_argument("--lm", help="Modelo n-gram creado solo con train")
-    evaluation.add_argument("--lm-weight", type=float, default=0.25)
+    evaluation.add_argument("--lm-weight", type=float, default=0.2)
+    evaluation.add_argument("--word-bonus", type=float, help="Por defecto 1 con --lm y 0 sin modelo de lenguaje")
+    evaluation.add_argument("--lm-smoothing", choices=["add-k", "kneser-ney"])
+    evaluation.add_argument("--workers", type=int, default=0, help="Procesos para el beam search; 0 = la mitad de los núcleos")
     args = parser.parse_args()
+    if getattr(args, "word_bonus", 0) is None:
+        args.word_bonus = 1.0 if args.lm else 0.0
     if args.command == "diagnose":
         import torch
         from .model import CRNN
@@ -123,9 +149,19 @@ def main():
     elif args.command == "build-lm":
         from .decoding import NGramLanguageModel
         texts = [entry.text for manifest in args.manifests for entry in read_manifest(manifest)]
-        model = NGramLanguageModel.train(texts, order=args.order)
+        model = NGramLanguageModel.train(texts, order=args.order, smoothing=args.smoothing)
         model.save(args.output)
         result = {"modelo": str(Path(args.output).resolve()), "orden": args.order, "frases": len(texts)}
+    elif args.command == "tune-decoder":
+        from .engine import tune_decoder
+
+        def numbers(text):
+            return tuple(float(value) for value in text.split(",") if value.strip())
+
+        result = tune_decoder(args.checkpoint, args.dev, args.lm, args.output, args.cache, args.clips, args.seed,
+                              numbers(args.lm_weights), numbers(args.word_bonuses),
+                              tuple(value.strip() for value in args.smoothings.split(",") if value.strip()),
+                              args.beam_width, args.workers or max(1, (os.cpu_count() or 2) // 2), args.device)
     elif args.command == "audit":
         partitions = {name: read_manifest(getattr(args, name)) for name in ("train", "dev", "test") if getattr(args, name)}
         result = audit_partitions(partitions)
@@ -141,14 +177,15 @@ def main():
         from .vad import VADConfig
         vad = VADConfig(max_segment_seconds=args.max_segment_seconds, overlap_seconds=args.overlap_seconds)
         result = transcribe(args.checkpoint, args.audio, args.device, args.beam_width, args.lm,
-                            args.lm_weight, args.min_confidence, vad)
+                            args.lm_weight, args.min_confidence, vad, args.word_bonus, args.lm_smoothing)
     else:
         from .engine import test_checkpoint
         output = Path(args.output)
         if output.exists():
             raise ValueError("Usa un archivo de evaluación nuevo")
         result = test_checkpoint(args.checkpoint, args.test, args.train, args.dev, args.device, args.cache,
-                                 args.beam_width, args.lm, args.lm_weight)
+                                 args.beam_width, args.lm, args.lm_weight, args.word_bonus, args.lm_smoothing,
+                                 args.workers or max(1, (os.cpu_count() or 2) // 2))
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         result = {"metricas": result["metrics"], "resultados": str(output.resolve())}

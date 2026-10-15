@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from .audio import read_audio
 from .data import SpeechDataset, audit_partitions, collate, read_manifest
-from .decoding import NGramLanguageModel, forced_align_words, prefix_beam_search
+from .decoding import SMOOTHINGS, DecoderPool, NGramLanguageModel, forced_align_words, prefix_beam_search
 from .features import FeatureConfig, extract_features, resample
 from .metrics import error_rates
 from .model import CRNN, ModelConfig
@@ -79,9 +79,11 @@ def _condition_breakdown(references, hypotheses, metadata):
 
 @torch.no_grad()
 def evaluate(model, loader, device, entries=None, include_breakdown=False,
-             beam_width=1, language_model=None, lm_weight=0.25):
+             beam_width=1, language_model=None, lm_weight=0.25, word_bonus=0.0,
+             lm_path=None, lm_smoothing=None, decode_workers=1):
+    """Con ``lm_path`` o ``decode_workers`` > 1, el beam search corre en procesos paralelos."""
     model.eval()
-    loss_sum, count, references, hypotheses, metadata = 0.0, 0, [], [], []
+    loss_sum, count, references, hypotheses, metadata, pending = 0.0, 0, [], [], [], []
     criterion = torch.nn.CTCLoss(blank=0, zero_infinity=False)
     for features, lengths, targets, target_lengths, texts in loader:
         log_probs, output_lengths = model(features.to(device), lengths)
@@ -92,14 +94,20 @@ def evaluate(model, loader, device, entries=None, include_breakdown=False,
         count += len(texts)
         references.extend(texts)
         if beam_width > 1:
-            for index, length in enumerate(output_lengths):
-                values = log_probs[:int(length), index].detach().cpu().numpy()
-                hypotheses.append(prefix_beam_search(values, beam_width, language_model, lm_weight, alternatives=1)[0]["texto"])
+            pending.extend(log_probs[:int(length), index].detach().cpu().numpy()
+                           for index, length in enumerate(output_lengths))
         else:
             hypotheses.extend(decode_batch(log_probs, output_lengths))
         if entries is not None:
             for index, length in enumerate(lengths.tolist()):
                 metadata.append({"entry": entries[count - len(texts) + index], "duration": length * 0.01})
+    if beam_width > 1:
+        if lm_path is not None or decode_workers > 1:
+            with DecoderPool(lm_path, lm_smoothing, decode_workers) as pool:
+                hypotheses = pool.decode(pending, beam_width, lm_weight if lm_path else 0.0, word_bonus)
+        else:
+            hypotheses = [prefix_beam_search(values, beam_width, language_model, lm_weight, word_bonus,
+                                             alternatives=1)[0]["texto"] for values in pending]
     rates = error_rates(references, hypotheses)
     rates["loss"] = loss_sum / count
     if include_breakdown and metadata:
@@ -330,7 +338,7 @@ def load_model(checkpoint_path, device_name="auto"):
 
 @torch.no_grad()
 def transcribe(checkpoint_path, audio_path, device_name="auto", beam_width=16, language_model_path=None,
-               lm_weight=0.25, min_confidence=0.15, vad_config=None):
+               lm_weight=0.25, min_confidence=0.15, vad_config=None, word_bonus=0.0, lm_smoothing=None):
     if beam_width < 1 or not 0 <= min_confidence <= 1 or lm_weight < 0:
         raise ValueError("Parámetros de decodificación no válidos")
     model, config, device = load_model(checkpoint_path, device_name)
@@ -344,7 +352,7 @@ def transcribe(checkpoint_path, audio_path, device_name="auto", beam_width=16, l
         return {"texto": "", "segmentos": [], "palabras": [], "confianza": 0.0,
                 "estado": "sin habla", "vad": vad,
                 "nota": "El VAD no encontró voz; no se ejecutó reconocimiento"}
-    language_model = NGramLanguageModel.load(language_model_path) if language_model_path else None
+    language_model = NGramLanguageModel.load(language_model_path, lm_smoothing) if language_model_path else None
     transcript, accepted, all_words = "", [], []
     for segment in segments:
         chunk = normalized_audio[segment.start_sample:segment.end_sample]
@@ -356,7 +364,7 @@ def transcribe(checkpoint_path, audio_path, device_name="auto", beam_width=16, l
             confidence = _greedy_confidence(log_probs, lengths[0])
             alternatives = [{"texto": text, "confianza": confidence}]
         else:
-            alternatives = prefix_beam_search(valid, beam_width, language_model, lm_weight)
+            alternatives = prefix_beam_search(valid, beam_width, language_model, lm_weight, word_bonus)
             text, confidence = alternatives[0]["texto"], alternatives[0]["confianza"]
         start, end = segment.seconds(config.sample_rate)
         rejected = not text or confidence < min_confidence
@@ -379,7 +387,8 @@ def transcribe(checkpoint_path, audio_path, device_name="auto", beam_width=16, l
 
 
 def test_checkpoint(checkpoint_path, test_path, train_path, dev_path, device_name="auto", cache_dir=None,
-                    beam_width=1, language_model_path=None, lm_weight=0.25):
+                    beam_width=1, language_model_path=None, lm_weight=0.25, word_bonus=0.0,
+                    lm_smoothing=None, decode_workers=1):
     if beam_width < 1 or lm_weight < 0:
         raise ValueError("Parámetros de decodificación no válidos")
     partitions = {"train": read_manifest(train_path), "dev": read_manifest(dev_path), "test": read_manifest(test_path)}
@@ -387,9 +396,10 @@ def test_checkpoint(checkpoint_path, test_path, train_path, dev_path, device_nam
     model, config, device = load_model(checkpoint_path, device_name)
     dataset = SpeechDataset(partitions["test"], config, cache_dir)
     loader = DataLoader(dataset, batch_size=8, collate_fn=collate)
-    language_model = NGramLanguageModel.load(language_model_path) if language_model_path else None
     metrics, predictions = evaluate(model, loader, device, partitions["test"], include_breakdown=True,
-                                    beam_width=beam_width, language_model=language_model, lm_weight=lm_weight)
+                                    beam_width=beam_width, lm_weight=lm_weight, word_bonus=word_bonus,
+                                    lm_path=language_model_path, lm_smoothing=lm_smoothing,
+                                    decode_workers=decode_workers)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     return {"metrics": metrics, "audit": audit,
             "checkpoint": {"path": str(Path(checkpoint_path).resolve()),
@@ -398,5 +408,57 @@ def test_checkpoint(checkpoint_path, test_path, train_path, dev_path, device_nam
                            "model_config": checkpoint.get("model_config")},
             "test_manifest": {"path": str(Path(test_path).resolve()), "sha256": _file_sha256(test_path)},
             "decoder": {"beam_width": beam_width, "language_model": language_model_path,
-                        "lm_weight": lm_weight},
+                        "lm_weight": lm_weight, "word_bonus": word_bonus, "lm_smoothing": lm_smoothing},
             "predictions": predictions}
+
+
+@torch.no_grad()
+def tune_decoder(checkpoint_path, dev_path, lm_path, output, cache_dir=None, clips=300, seed=13,
+                 lm_weights=(0.1, 0.2, 0.3, 0.5), word_bonuses=(0.0, 1.0, 2.0, 3.0),
+                 smoothings=SMOOTHINGS, beam_width=16, workers=1, device_name="auto"):
+    """Elige peso del modelo de lenguaje, premio por palabra y suavizado con una muestra fija de dev.
+
+    La red se ejecuta una sola vez por clip; después solo cambia la decodificación. Nunca usar test aquí:
+    la configuración elegida se mide en test una sola vez, al final, con ``evaluate``.
+    """
+    output = Path(output)
+    if output.exists():
+        raise ValueError("Usa un archivo de resultados nuevo")
+    if clips < 1 or beam_width < 2 or any(value < 0 for value in lm_weights) or not set(smoothings) <= set(SMOOTHINGS):
+        raise ValueError("Parámetros de ajuste no válidos")
+    entries = read_manifest(dev_path)
+    random.Random(seed).shuffle(entries)
+    entries = entries[:clips]
+    model, config, device = load_model(checkpoint_path, device_name)
+    loader = DataLoader(SpeechDataset(entries, config, cache_dir), batch_size=16, collate_fn=collate)
+    arrays, references = [], []
+    for features, lengths, _, _, texts in loader:
+        log_probs, output_lengths = model(features.to(device), lengths)
+        arrays.extend(log_probs[:int(length), index].cpu().numpy() for index, length in enumerate(output_lengths))
+        references.extend(texts)
+
+    results = []
+
+    def record(hypotheses, **decoder):
+        rates = error_rates(references, hypotheses)
+        results.append({**decoder, "wer": rates["wer"], "cer": rates["cer"]})
+        print(json.dumps(results[-1], ensure_ascii=False), flush=True)
+
+    record([greedy_decode(values.argmax(-1)) for values in arrays], decodificador="greedy")
+    with DecoderPool(None, workers=workers) as pool:
+        record(pool.decode(arrays, beam_width, 0.0, 0.0), decodificador="beam", beam_width=beam_width)
+    for smoothing in smoothings:
+        with DecoderPool(lm_path, smoothing, workers) as pool:
+            for lm_weight in lm_weights:
+                for word_bonus in word_bonuses:
+                    record(pool.decode(arrays, beam_width, lm_weight, word_bonus), decodificador="beam+lm",
+                           beam_width=beam_width, lm_smoothing=smoothing, lm_weight=lm_weight,
+                           word_bonus=word_bonus)
+    best = min(results, key=lambda item: (item["wer"], item["cer"]))
+    report = {"checkpoint": str(Path(checkpoint_path).resolve()), "sha256": _file_sha256(checkpoint_path),
+              "dev_manifest": str(Path(dev_path).resolve()), "language_model": str(Path(lm_path).resolve()),
+              "clips": len(entries), "seed": seed, "mejor": best, "resultados": results,
+              "nota": "Seleccionado solo con dev; medir la configuración elegida en test una única vez"}
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"mejor": best, "resultados": str(output.resolve())}

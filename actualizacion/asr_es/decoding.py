@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 import json
 import math
+import multiprocessing
 from pathlib import Path
 
 import numpy as np
@@ -28,21 +29,52 @@ def _tokens_to_raw_text(tokens):
     return "".join(ALPHABET[int(token) - 1] for token in tokens)
 
 
-class NGramLanguageModel:
-    """Modelo de palabras con suavizado aditivo, entrenado solo con texto local."""
+SMOOTHINGS = ("add-k", "kneser-ney")
 
-    def __init__(self, order=2, add_k=0.5, counts=None, context_counts=None, vocabulary=None):
-        if order < 1 or add_k <= 0:
+
+class NGramLanguageModel:
+    """Modelo de palabras entrenado solo con texto local.
+
+    Suavizados:
+    - ``add-k``: suma k a todos los conteos. Con vocabularios grandes reparte casi toda la
+      masa entre palabras no vistas y castiga por igual cada palabra nueva.
+    - ``kneser-ney``: bigrama interpolado con descuento absoluto. La probabilidad de respaldo
+      de una palabra depende de en cuántos contextos distintos aparece (continuación), no de su
+      frecuencia. Se calcula con los mismos conteos guardados, sin releer el texto.
+    """
+
+    def __init__(self, order=2, add_k=0.5, counts=None, context_counts=None, vocabulary=None,
+                 smoothing="add-k", discount=0.75):
+        if order < 1 or add_k <= 0 or smoothing not in SMOOTHINGS or not 0 < discount < 1:
             raise ValueError("Configuración n-gram no válida")
+        if smoothing == "kneser-ney" and order != 2:
+            raise ValueError("Kneser-Ney está implementado para bigramas (--order 2)")
         self.order = order
         self.add_k = float(add_k)
+        self.smoothing = smoothing
+        self.discount = float(discount)
         self.counts = Counter(counts or {})
         self.context_counts = Counter(context_counts or {})
         self.vocabulary = set(vocabulary or [])
+        self._kneser_ney = None
+        self._word_cache, self._score_cache = {}, {}
+
+    def _prepare_kneser_ney(self):
+        followers, predecessors = Counter(), Counter()
+        for (previous, word), count in self.counts.items():
+            if count > 0:
+                followers[previous] += 1
+                predecessors[word] += 1
+        # +1 de continuación para <unk>: así la masa de respaldo suma 1 incluyendo palabras nuevas.
+        self._kneser_ney = (followers, predecessors, len(self.counts) + 1)
+
+    def _continuation(self, word):
+        _, predecessors, total = self._kneser_ney
+        return (predecessors[word] if word != "<unk>" else 1) / total
 
     @classmethod
-    def train(cls, texts, order=2, add_k=0.5):
-        model = cls(order, add_k)
+    def train(cls, texts, order=2, add_k=0.5, smoothing="add-k", discount=0.75):
+        model = cls(order, add_k, smoothing=smoothing, discount=discount)
         for text in texts:
             words = text.split()
             model.vocabulary.update(words)
@@ -59,12 +91,34 @@ class NGramLanguageModel:
     def _word_score(self, context, word):
         word = word if word in self.vocabulary else "<unk>"
         context = tuple(context[-(self.order - 1):]) if self.order > 1 else ()
-        vocabulary_size = max(1, len(self.vocabulary))
-        numerator = self.counts[context + (word,)] + self.add_k
-        denominator = self.context_counts[context] + self.add_k * vocabulary_size
-        return math.log(numerator / denominator)
+        key = context + (word,)
+        if key in self._word_cache:
+            return self._word_cache[key]
+        if self.smoothing == "kneser-ney":
+            if self._kneser_ney is None:
+                self._prepare_kneser_ney()
+            followers = self._kneser_ney[0]
+            context_count = self.context_counts[context]
+            continuation = self._continuation(word)
+            if context_count:
+                discounted = max(self.counts[key] - self.discount, 0) / context_count
+                backoff = self.discount * followers[context[0]] / context_count
+                probability = discounted + backoff * continuation
+            else:
+                probability = continuation
+        else:
+            vocabulary_size = max(1, len(self.vocabulary))
+            probability = (self.counts[key] + self.add_k) / (self.context_counts[context] + self.add_k * vocabulary_size)
+        result = math.log(probability)
+        if len(self._word_cache) > 2_000_000:
+            self._word_cache.clear()
+        self._word_cache[key] = result
+        return result
 
     def score(self, text, final=False):
+        cache_key = (text, final)
+        if cache_key in self._score_cache:
+            return self._score_cache[cache_key]
         words = text.split()
         # Durante búsqueda, la última palabra aún puede crecer si no termina en espacio.
         complete = words if final or text.endswith(" ") else words[:-1]
@@ -75,6 +129,9 @@ class NGramLanguageModel:
             context.append(word if word in self.vocabulary else "<unk>")
         if final:
             score += self._word_score(context, "</s>")
+        if len(self._score_cache) > 500_000:
+            self._score_cache.clear()
+        self._score_cache[cache_key] = score
         return score
 
     def save(self, path):
@@ -82,6 +139,8 @@ class NGramLanguageModel:
             "format_version": 1,
             "order": self.order,
             "add_k": self.add_k,
+            "smoothing": self.smoothing,
+            "discount": self.discount,
             "vocabulary": sorted(self.vocabulary),
             "counts": [[list(key), value] for key, value in self.counts.items()],
             "context_counts": [[list(key), value] for key, value in self.context_counts.items()],
@@ -93,7 +152,8 @@ class NGramLanguageModel:
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, smoothing=None):
+        """``smoothing`` permite usar los conteos de un archivo con otro suavizado (p. ej. uno add-k como Kneser-Ney)."""
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if payload.get("format_version") != 1:
             raise ValueError("Modelo n-gram incompatible")
@@ -102,6 +162,8 @@ class NGramLanguageModel:
             {tuple(key): value for key, value in payload["counts"]},
             {tuple(key): value for key, value in payload["context_counts"]},
             payload["vocabulary"],
+            smoothing=smoothing or payload.get("smoothing", "add-k"),
+            discount=payload.get("discount", 0.75),
         )
 
 
@@ -153,6 +215,51 @@ def prefix_beam_search(log_probs, beam_width=16, language_model=None, lm_weight=
             "confianza": float(math.exp(min(0.0, acoustic / max(1, len(values))))),
         })
     return results
+
+
+_WORKER_LANGUAGE_MODEL = None
+
+
+def _init_decoder_worker(lm_path, smoothing):
+    global _WORKER_LANGUAGE_MODEL
+    _WORKER_LANGUAGE_MODEL = NGramLanguageModel.load(lm_path, smoothing) if lm_path else None
+
+
+def _decode_one(job):
+    values, beam_width, lm_weight, word_bonus = job
+    model = _WORKER_LANGUAGE_MODEL if lm_weight > 0 else None
+    return prefix_beam_search(values, beam_width, model, lm_weight, word_bonus, alternatives=1)[0]["texto"]
+
+
+class DecoderPool:
+    """Decodifica muchas secuencias con prefix beam search, en paralelo si ``workers`` > 1.
+
+    Cada proceso carga el modelo de lenguaje una sola vez y se reutiliza para varias
+    combinaciones de peso y premio por palabra.
+    """
+
+    def __init__(self, lm_path=None, smoothing=None, workers=1):
+        self.lm_path, self.smoothing, self.workers = lm_path, smoothing, max(1, int(workers))
+        self._pool = None
+
+    def __enter__(self):
+        if self.workers > 1:
+            context = multiprocessing.get_context("spawn")
+            self._pool = context.Pool(self.workers, _init_decoder_worker, (self.lm_path, self.smoothing))
+        else:
+            _init_decoder_worker(self.lm_path, self.smoothing)
+        return self
+
+    def __exit__(self, *error):
+        if self._pool:
+            self._pool.terminate() if error[0] else self._pool.close()
+            self._pool.join()
+
+    def decode(self, arrays, beam_width=16, lm_weight=0.25, word_bonus=0.0):
+        jobs = [(np.asarray(values, dtype=np.float32), beam_width, lm_weight, word_bonus) for values in arrays]
+        if self._pool:
+            return self._pool.map(_decode_one, jobs, chunksize=4)
+        return [_decode_one(job) for job in jobs]
 
 
 def forced_align_words(log_probs, text, frame_seconds=0.02, offset_seconds=0.0):
