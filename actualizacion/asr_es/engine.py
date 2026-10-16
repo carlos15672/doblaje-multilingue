@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -80,7 +81,7 @@ def _condition_breakdown(references, hypotheses, metadata):
 @torch.no_grad()
 def evaluate(model, loader, device, entries=None, include_breakdown=False,
              beam_width=1, language_model=None, lm_weight=0.25, word_bonus=0.0,
-             lm_path=None, lm_smoothing=None, decode_workers=1):
+             lm_path=None, lm_smoothing=None, decode_workers=1, prefix_penalty=0.0, phonetic=False):
     """Con ``lm_path`` o ``decode_workers`` > 1, el beam search corre en procesos paralelos."""
     model.eval()
     loss_sum, count, references, hypotheses, metadata, pending = 0.0, 0, [], [], [], []
@@ -104,10 +105,12 @@ def evaluate(model, loader, device, entries=None, include_breakdown=False,
     if beam_width > 1:
         if lm_path is not None or decode_workers > 1:
             with DecoderPool(lm_path, lm_smoothing, decode_workers) as pool:
-                hypotheses = pool.decode(pending, beam_width, lm_weight if lm_path else 0.0, word_bonus)
+                hypotheses = pool.decode(pending, beam_width, lm_weight if lm_path else 0.0, word_bonus,
+                                         prefix_penalty, phonetic)
         else:
             hypotheses = [prefix_beam_search(values, beam_width, language_model, lm_weight, word_bonus,
-                                             alternatives=1)[0]["texto"] for values in pending]
+                                             alternatives=1, prefix_penalty=prefix_penalty if language_model else 0.0,
+                                             phonetic=phonetic)[0]["texto"] for values in pending]
     rates = error_rates(references, hypotheses)
     rates["loss"] = loss_sum / count
     if include_breakdown and metadata:
@@ -141,8 +144,9 @@ def _file_sha256(path):
 
 def train(train_path, dev_path, output, epochs=20, batch_size=8, learning_rate=0.001,
           device_name="auto", seed=42, hidden_size=128, cache_dir=None, workers=0, resume=False,
-          augment=False, init_checkpoint=None):
-    if epochs < 1 or batch_size < 1 or learning_rate <= 0 or hidden_size < 4 or workers < 0:
+          augment=False, init_checkpoint=None, lr_schedule="constant", min_lr_factor=0.05):
+    if (epochs < 1 or batch_size < 1 or learning_rate <= 0 or hidden_size < 4 or workers < 0
+            or lr_schedule not in ("constant", "cosine") or not 0 < min_lr_factor <= 1):
         raise ValueError("Parámetros de entrenamiento no válidos")
     if resume and init_checkpoint:
         raise ValueError("--resume y --init-checkpoint son mutuamente excluyentes")
@@ -159,9 +163,11 @@ def train(train_path, dev_path, output, epochs=20, batch_size=8, learning_rate=0
             raise ValueError("No hay una corrida que reanudar en esa carpeta (faltan config.json y last.pt/best.pt)")
         run_info = json.loads((output / "config.json").read_text(encoding="utf-8"))
         requested = {"batch_size": batch_size, "learning_rate": learning_rate, "seed": seed,
-                     "augmentation": bool(augment)}
-        changed = [key for key, value in requested.items()
-                   if run_info.get(key, False if key == "augmentation" else None) != value]
+                     "augmentation": bool(augment), "lr_schedule": lr_schedule}
+        defaults = {"augmentation": False, "lr_schedule": "constant"}  # corridas guardadas antes de estas opciones
+        changed = [key for key, value in requested.items() if run_info.get(key, defaults.get(key)) != value]
+        if lr_schedule == "cosine" and run_info.get("epochs") != epochs:
+            changed.append("epochs")  # el coseno depende del total de épocas
         for key, path in (("train_manifest", train_path), ("dev_manifest", dev_path)):
             if Path(run_info.get(key, "")).resolve() != Path(path).resolve():
                 changed.append(key)
@@ -205,6 +211,10 @@ def train(train_path, dev_path, output, epochs=20, batch_size=8, learning_rate=0
     device = choose_device(device_name)
     model = CRNN(model_config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # Coseno: la tasa baja suavemente de learning_rate a learning_rate * min_lr_factor en `epochs` épocas.
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs,
+                                                            eta_min=learning_rate * min_lr_factor)
+                 if lr_schedule == "cosine" else None)
     generator = torch.Generator().manual_seed(seed)
     start_epoch, best = 0, (float("inf"), float("inf"))
     if previous is not None:
@@ -224,6 +234,14 @@ def train(train_path, dev_path, output, epochs=20, batch_size=8, learning_rate=0
             else:
                 generator.manual_seed(seed + start_epoch)  # no repetir el orden de la primera época
                 best = (previous["metrics"]["dev_wer"], previous["metrics"]["dev_loss"])
+            if scheduler is not None:
+                if "scheduler" in previous:
+                    scheduler.load_state_dict(previous["scheduler"])
+                else:  # solo pesos: avanzar el coseno hasta la época donde se quedó
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        for _ in range(start_epoch):
+                            scheduler.step()
             print(f"Reanudando después de la época {start_epoch} desde {source.name}"
                   f"{'' if 'optimizer' in previous else ' (solo pesos; optimizador nuevo)'}", flush=True)
     output.mkdir(parents=True, exist_ok=True)
@@ -265,6 +283,7 @@ def train(train_path, dev_path, output, epochs=20, batch_size=8, learning_rate=0
                     "train_manifest_sha256": _file_sha256(train_path),
                     "dev_manifest_sha256": _file_sha256(dev_path),
                     "feature_cache": str(cache), "data_workers": workers, "augmentation": bool(augment),
+                    "lr_schedule": lr_schedule, "min_lr_factor": min_lr_factor,
                     "pretrained_weights": bool(warmstart)}
         if warmstart:
             run_info["initial_checkpoint"] = {
@@ -300,7 +319,10 @@ def train(train_path, dev_path, output, epochs=20, batch_size=8, learning_rate=0
         metrics, examples = evaluate(model, dev_loader, device)
         record = {"epoch": epoch, "train_loss": total_loss / count,
                   "dev_loss": metrics["loss"], "dev_wer": metrics["wer"], "dev_cer": metrics["cer"],
+                  "learning_rate": optimizer.param_groups[0]["lr"],
                   "minutes": round((time.time() - epoch_start) / 60, 1)}
+        if scheduler is not None:
+            scheduler.step()
         with (output / "history.jsonl").open("a", encoding="utf-8") as history:
             history.write(json.dumps(record) + "\n")
         print(json.dumps(record), flush=True)
@@ -315,8 +337,11 @@ def train(train_path, dev_path, output, epochs=20, batch_size=8, learning_rate=0
             _save_atomic(checkpoint, output / "best.pt")
             (output / "dev_predictions.json").write_text(json.dumps(examples, ensure_ascii=False, indent=2), encoding="utf-8")
         # Estado completo para `--resume`: si se corta, se continúa desde la última época terminada.
-        _save_atomic({**checkpoint, "optimizer": optimizer.state_dict(), "generator": generator.get_state(),
-                      "best": list(best)}, output / "last.pt")
+        state = {**checkpoint, "optimizer": optimizer.state_dict(), "generator": generator.get_state(),
+                 "best": list(best)}
+        if scheduler is not None:
+            state["scheduler"] = scheduler.state_dict()
+        _save_atomic(state, output / "last.pt")
     return {"checkpoint": str((output / "best.pt").resolve()), "mejor_dev_wer": best[0],
             "nota": "Resultado de validación; falta evaluación final en test y micrófono"}
 
@@ -338,7 +363,8 @@ def load_model(checkpoint_path, device_name="auto"):
 
 @torch.no_grad()
 def transcribe(checkpoint_path, audio_path, device_name="auto", beam_width=16, language_model_path=None,
-               lm_weight=0.25, min_confidence=0.15, vad_config=None, word_bonus=0.0, lm_smoothing=None):
+               lm_weight=0.25, min_confidence=0.15, vad_config=None, word_bonus=0.0, lm_smoothing=None,
+               prefix_penalty=0.0, phonetic=False):
     if beam_width < 1 or not 0 <= min_confidence <= 1 or lm_weight < 0:
         raise ValueError("Parámetros de decodificación no válidos")
     model, config, device = load_model(checkpoint_path, device_name)
@@ -364,7 +390,9 @@ def transcribe(checkpoint_path, audio_path, device_name="auto", beam_width=16, l
             confidence = _greedy_confidence(log_probs, lengths[0])
             alternatives = [{"texto": text, "confianza": confidence}]
         else:
-            alternatives = prefix_beam_search(valid, beam_width, language_model, lm_weight, word_bonus)
+            alternatives = prefix_beam_search(valid, beam_width, language_model, lm_weight, word_bonus,
+                                              prefix_penalty=prefix_penalty if language_model else 0.0,
+                                              phonetic=phonetic)
             text, confidence = alternatives[0]["texto"], alternatives[0]["confianza"]
         start, end = segment.seconds(config.sample_rate)
         rejected = not text or confidence < min_confidence
@@ -388,7 +416,7 @@ def transcribe(checkpoint_path, audio_path, device_name="auto", beam_width=16, l
 
 def test_checkpoint(checkpoint_path, test_path, train_path, dev_path, device_name="auto", cache_dir=None,
                     beam_width=1, language_model_path=None, lm_weight=0.25, word_bonus=0.0,
-                    lm_smoothing=None, decode_workers=1):
+                    lm_smoothing=None, decode_workers=1, prefix_penalty=0.0, phonetic=False):
     if beam_width < 1 or lm_weight < 0:
         raise ValueError("Parámetros de decodificación no válidos")
     partitions = {"train": read_manifest(train_path), "dev": read_manifest(dev_path), "test": read_manifest(test_path)}
@@ -399,7 +427,8 @@ def test_checkpoint(checkpoint_path, test_path, train_path, dev_path, device_nam
     metrics, predictions = evaluate(model, loader, device, partitions["test"], include_breakdown=True,
                                     beam_width=beam_width, lm_weight=lm_weight, word_bonus=word_bonus,
                                     lm_path=language_model_path, lm_smoothing=lm_smoothing,
-                                    decode_workers=decode_workers)
+                                    decode_workers=decode_workers, prefix_penalty=prefix_penalty,
+                                    phonetic=phonetic)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     return {"metrics": metrics, "audit": audit,
             "checkpoint": {"path": str(Path(checkpoint_path).resolve()),
@@ -408,14 +437,16 @@ def test_checkpoint(checkpoint_path, test_path, train_path, dev_path, device_nam
                            "model_config": checkpoint.get("model_config")},
             "test_manifest": {"path": str(Path(test_path).resolve()), "sha256": _file_sha256(test_path)},
             "decoder": {"beam_width": beam_width, "language_model": language_model_path,
-                        "lm_weight": lm_weight, "word_bonus": word_bonus, "lm_smoothing": lm_smoothing},
+                        "lm_weight": lm_weight, "word_bonus": word_bonus, "lm_smoothing": lm_smoothing,
+                        "prefix_penalty": prefix_penalty, "phonetic": phonetic},
             "predictions": predictions}
 
 
 @torch.no_grad()
 def tune_decoder(checkpoint_path, dev_path, lm_path, output, cache_dir=None, clips=300, seed=13,
                  lm_weights=(0.1, 0.2, 0.3, 0.5), word_bonuses=(0.0, 1.0, 2.0, 3.0),
-                 smoothings=SMOOTHINGS, beam_width=16, workers=1, device_name="auto"):
+                 smoothings=SMOOTHINGS, beam_width=16, workers=1, device_name="auto",
+                 prefix_penalties=(0.0,), phonetic_variants=False):
     """Elige peso del modelo de lenguaje, premio por palabra y suavizado con una muestra fija de dev.
 
     La red se ejecuta una sola vez por clip; después solo cambia la decodificación. Nunca usar test aquí:
@@ -424,7 +455,8 @@ def tune_decoder(checkpoint_path, dev_path, lm_path, output, cache_dir=None, cli
     output = Path(output)
     if output.exists():
         raise ValueError("Usa un archivo de resultados nuevo")
-    if clips < 1 or beam_width < 2 or any(value < 0 for value in lm_weights) or not set(smoothings) <= set(SMOOTHINGS):
+    if (clips < 1 or beam_width < 2 or any(value < 0 for value in (*lm_weights, *prefix_penalties))
+            or not set(smoothings) <= set(SMOOTHINGS)):
         raise ValueError("Parámetros de ajuste no válidos")
     entries = read_manifest(dev_path)
     random.Random(seed).shuffle(entries)
@@ -451,9 +483,15 @@ def tune_decoder(checkpoint_path, dev_path, lm_path, output, cache_dir=None, cli
         with DecoderPool(lm_path, smoothing, workers) as pool:
             for lm_weight in lm_weights:
                 for word_bonus in word_bonuses:
-                    record(pool.decode(arrays, beam_width, lm_weight, word_bonus), decodificador="beam+lm",
-                           beam_width=beam_width, lm_smoothing=smoothing, lm_weight=lm_weight,
-                           word_bonus=word_bonus)
+                    for prefix_penalty in prefix_penalties:
+                        # Un solo haz por combinación; la corrección fonética se aplica después.
+                        pairs = pool.decode_variants(arrays, beam_width, lm_weight, word_bonus, prefix_penalty,
+                                                     phonetic_variants)
+                        settings = dict(decodificador="beam+lm", beam_width=beam_width, lm_smoothing=smoothing,
+                                        lm_weight=lm_weight, word_bonus=word_bonus, prefix_penalty=prefix_penalty)
+                        record([text for text, _ in pairs], **settings, phonetic=False)
+                        if phonetic_variants:
+                            record([corrected for _, corrected in pairs], **settings, phonetic=True)
     best = min(results, key=lambda item: (item["wer"], item["cer"]))
     report = {"checkpoint": str(Path(checkpoint_path).resolve()), "sha256": _file_sha256(checkpoint_path),
               "dev_manifest": str(Path(dev_path).resolve()), "language_model": str(Path(lm_path).resolve()),

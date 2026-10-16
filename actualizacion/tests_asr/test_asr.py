@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -14,7 +15,8 @@ from asr_es.audio import read_audio, write_wav
 from asr_es.augment import AugmentConfig, augment_audio, mask_features
 from asr_es.data import (Entry, SpeechDataset, audit_partitions, cache_features, cache_path,
                          prepare_common_voice, read_manifest)
-from asr_es.decoding import DecoderPool, NGramLanguageModel, forced_align_words, prefix_beam_search
+from asr_es.decoding import (DecoderPool, NGramLanguageModel, forced_align_words, mexican_phonetic_key,
+                             prefix_beam_search)
 from asr_es.engine import load_model, train, transcribe, tune_decoder
 from asr_es.features import FeatureConfig, _resample_direct, extract_features, radix2_rfft, resample
 from asr_es.metrics import error_rates
@@ -224,8 +226,37 @@ class TextAndDataTests(unittest.TestCase):
             converted = NGramLanguageModel.load(path, smoothing="kneser-ney")
             self.assertAlmostEqual(converted.score("el río es grande", final=True),
                                    kneser.score("el río es grande", final=True), places=12)
+        # El bigrama general coincide con la fórmula cerrada de Kneser-Ney interpolado.
+        followers = sum(1 for (previous, _) in kneser.counts if previous == "la")
+        predecessors = sum(1 for (_, word) in kneser.counts if word == "ciudad")
+        expected = ((kneser.counts[("la", "ciudad")] - 0.75) / kneser.context_counts[("la",)]
+                    + 0.75 * followers / kneser.context_counts[("la",)] * predecessors / (len(kneser.counts) + 1))
+        self.assertAlmostEqual(math.exp(kneser._word_score(["la"], "ciudad")), expected, places=12)
         with self.assertRaises(ValueError):
-            NGramLanguageModel.train(texts, order=3, smoothing="kneser-ney")
+            NGramLanguageModel.train(texts, order=1, smoothing="kneser-ney")
+
+    def test_kneser_ney_trigram_is_a_distribution(self):
+        texts = ["el río cruza la ciudad", "la ciudad es grande", "el río es largo", "el río cruza el valle"]
+        model = NGramLanguageModel.train(texts, order=3, smoothing="kneser-ney")
+        vocabulary = sorted(model.vocabulary)
+        for context in (["el", "río"], ["la", "ciudad"], ["nada", "río"], ["nada", "nada"]):
+            total = sum(math.exp(model._word_score(context, word)) for word in vocabulary)
+            self.assertAlmostEqual(total, 1.0, places=9)
+        # El trigrama distingue lo que el bigrama mezcla: tras "río cruza" sigue "la" o "el".
+        self.assertGreater(model._word_score(["río", "cruza"], "la"), model._word_score(["río", "cruza"], "ciudad"))
+
+    def test_mexican_phonetic_key_and_homophone_correction(self):
+        same = [("vaca", "baca"), ("hola", "ola"), ("casa", "kasa"), ("cena", "sena"), ("gente", "jente"),
+                ("llave", "yabe"), ("corrieron", "corieron"), ("río", "rio"), ("hoy", "oi"), ("queso", "keso")]
+        for left, right in same:
+            self.assertEqual(mexican_phonetic_key(left), mexican_phonetic_key(right), (left, right))
+        for left, right in (("guerra", "jerra"), ("chico", "ico"), ("pero", "peso")):
+            self.assertNotEqual(mexican_phonetic_key(left), mexican_phonetic_key(right), (left, right))
+        model = NGramLanguageModel.train(["debido a la lluvia", "la casa de la vaca", "hola a todos"],
+                                         smoothing="kneser-ney")
+        self.assertEqual(model.correct_homophones("devido a la yuvia"), "debido a la lluvia")
+        self.assertEqual(model.correct_homophones("ola a todos xyz"), "hola a todos xyz")  # xyz no tiene homófono
+        self.assertEqual(model.correct_homophones("la vaca"), "la vaca")  # palabras reales no se tocan
 
     def test_word_bonus_and_parallel_decoding(self):
         a, space, b = encode("a b")
@@ -235,6 +266,18 @@ class TextAndDataTests(unittest.TestCase):
         probabilities[1, 0], probabilities[1, space] = -0.6, -0.8  # el espacio es algo menos probable
         self.assertEqual(prefix_beam_search(probabilities, beam_width=4)[0]["texto"], "ab")
         self.assertEqual(prefix_beam_search(probabilities, beam_width=4, word_bonus=1.0)[0]["texto"], "a b")
+        # Con un haz de 1, el espacio se decide en un solo paso: el premio debe llegar junto con la palabra
+        # terminada. Si se premiara la palabra a medias, "a" (sin espacio) empataría y ganaría "ab".
+        self.assertEqual(prefix_beam_search(probabilities, beam_width=1, word_bonus=1.0)[0]["texto"], "a b")
+        # Penalización de prefijos: "k..." no inicia ninguna palabra del vocabulario.
+        c, k, a2, s = (encode(letter)[0] for letter in "ckas")
+        casa = np.full((4, classes), -12.0)
+        casa[0, c], casa[0, k] = -0.8, -0.6
+        casa[1, a2], casa[2, s], casa[3, a2] = -0.01, -0.01, -0.01
+        vocabulary_model = NGramLanguageModel.train(["la casa"], smoothing="kneser-ney")
+        options = dict(beam_width=1, language_model=vocabulary_model, lm_weight=0.01)
+        self.assertEqual(prefix_beam_search(casa, **options)[0]["texto"], "kasa")
+        self.assertEqual(prefix_beam_search(casa, **options, prefix_penalty=1.0)[0]["texto"], "casa")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "lm.json"
             NGramLanguageModel.train(["a b", "a casa"]).save(path)
@@ -317,6 +360,47 @@ class NetworkTests(unittest.TestCase):
             self.assertIn(tuned["mejor"], report["resultados"])
             with self.assertRaises(ValueError):
                 tune_decoder(checkpoint, root / "dev.csv", root / "lm.json", root / "ajuste.json", clips=2)
+
+    def test_cosine_learning_rate_decays_and_survives_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            t = np.arange(6400) / 16000
+            for split in ("train", "dev"):
+                with (root / f"{split}.csv").open("w", encoding="utf-8", newline="") as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(["audio", "text", "speaker"])
+                    for i, letter in enumerate(("a", "e")):
+                        write_wav(root / f"{split}{i}.wav", 0.5 * np.sin(2 * np.pi * (300 + 200 * i) * t))
+                        writer.writerow([f"{split}{i}.wav", letter, f"synthetic-{split}-{i}"])
+            options = dict(batch_size=2, hidden_size=8, device_name="cpu", learning_rate=0.01, lr_schedule="cosine")
+
+            def rates(run):
+                return [json.loads(line)["learning_rate"] for line in (run / "history.jsonl").read_text().splitlines()]
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                train(root / "train.csv", root / "dev.csv", root / "seguida", epochs=3, **options)
+                # Corte simulado: la evaluación de la época 3 falla, después de guardar last.pt de la época 2.
+                original, calls = train.__globals__["evaluate"], []
+
+                def failing_evaluate(*args, **kwargs):
+                    calls.append(1)
+                    if len(calls) == 3:
+                        raise RuntimeError("corte simulado")
+                    return original(*args, **kwargs)
+
+                with mock.patch.dict(train.__globals__, {"evaluate": failing_evaluate}):
+                    with self.assertRaises(RuntimeError):
+                        train(root / "train.csv", root / "dev.csv", root / "cortada", epochs=3, **options)
+                for changed in ({"lr_schedule": "constant"}, {"epochs": 4}):  # la curva no puede cambiar
+                    with self.assertRaises(ValueError):
+                        train(root / "train.csv", root / "dev.csv", root / "cortada", resume=True,
+                              **{"epochs": 3, **options, **changed})
+                train(root / "train.csv", root / "dev.csv", root / "cortada", epochs=3, resume=True, **options)
+            self.assertIn("scheduler", torch.load(root / "cortada" / "last.pt", weights_only=True))
+            continuous = rates(root / "seguida")
+            self.assertEqual(continuous[0], 0.01)
+            self.assertTrue(continuous[0] > continuous[1] > continuous[2] >= 0.01 * 0.05)
+            self.assertEqual(rates(root / "cortada"), continuous)
 
     def test_resume_continues_interrupted_run(self):
         with tempfile.TemporaryDirectory() as directory:

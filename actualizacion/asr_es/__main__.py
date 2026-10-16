@@ -12,6 +12,10 @@ from .audio import read_audio, record
 from .data import audit_partitions, prepare_common_voice, read_manifest
 from .features import FeatureConfig, extract_features
 
+# Decodificador con modelo de lenguaje elegido con tune-decoder solo en dev (ver README).
+LM_DECODER_DEFAULTS = {"lm_weight": 0.6, "word_bonus": 2.0, "prefix_penalty": 15.0, "phonetic": True}
+NO_LM_DECODER = {"lm_weight": 0.0, "word_bonus": 0.0, "prefix_penalty": 0.0, "phonetic": False}
+
 
 def main():
     parser = argparse.ArgumentParser(description="Reconocedor experimental de español, sin modelos preentrenados")
@@ -38,7 +42,7 @@ def main():
     language = commands.add_parser("build-lm", help="Entrenar un modelo n-gram solo con manifiestos locales")
     language.add_argument("manifests", nargs="+", help="CSV cuyos textos se usarán, normalmente solo train")
     language.add_argument("--output", required=True)
-    language.add_argument("--order", type=int, default=2)
+    language.add_argument("--order", type=int, default=3)
     language.add_argument("--smoothing", choices=["add-k", "kneser-ney"], default="kneser-ney",
                           help="Suavizado; kneser-ney requiere --order 2")
     tuning = commands.add_parser("tune-decoder", help="Elegir peso del LM, premio por palabra y suavizado con dev")
@@ -52,6 +56,9 @@ def main():
     tuning.add_argument("--lm-weights", default="0.1,0.2,0.3,0.5")
     tuning.add_argument("--word-bonuses", default="0,1,2,3")
     tuning.add_argument("--smoothings", default="add-k,kneser-ney")
+    tuning.add_argument("--prefix-penalties", default="0", help="Penalizaciones por prefijo inexistente a probar")
+    tuning.add_argument("--phonetic-variants", action="store_true",
+                        help="Medir también cada combinación con corrección de homófonos")
     tuning.add_argument("--beam-width", type=int, default=16)
     tuning.add_argument("--workers", type=int, default=0, help="Procesos de decodificación; 0 = la mitad de los núcleos")
     tuning.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -68,6 +75,10 @@ def main():
     training.add_argument("--learning-rate", type=float, default=0.001)
     training.add_argument("--hidden-size", type=int, default=128)
     training.add_argument("--augment", action="store_true", help="Ruido, ganancia, velocidad y máscaras tiempo/frecuencia")
+    training.add_argument("--lr-schedule", choices=["constant", "cosine"], default="constant",
+                          help="cosine baja la tasa de aprendizaje suavemente durante las épocas")
+    training.add_argument("--min-lr-factor", type=float, default=0.05,
+                          help="Con cosine, la tasa final es learning_rate por este factor")
     training.add_argument("--seed", type=int, default=42)
     training.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     training.add_argument("--cache", help="Caché de características creada con cache-features")
@@ -85,12 +96,14 @@ def main():
     recognition.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     recognition.add_argument("--beam-width", type=int, default=16, help="1 = greedy; valores mayores usan prefix beam search")
     recognition.add_argument("--lm", help="Modelo n-gram creado con build-lm")
-    # Valores elegidos con tune-decoder en dev (Kneser-Ney: 300 + 1000 clips): peso 0.2, premio 1.
-    recognition.add_argument("--lm-weight", type=float, default=0.2)
+    recognition.add_argument("--lm-weight", type=float, help="Peso del LM (por defecto, el elegido en dev)")
     recognition.add_argument("--word-bonus", type=float,
-                             help="Premio por palabra; compensa que el LM castigue cada palabra nueva. "
-                                  "Por defecto 1 con --lm y 0 sin modelo de lenguaje")
+                             help="Premio por palabra terminada; compensa que el LM castigue cada palabra nueva")
     recognition.add_argument("--lm-smoothing", choices=["add-k", "kneser-ney"], help="Usar los conteos del LM con otro suavizado")
+    recognition.add_argument("--prefix-penalty", type=float,
+                             help="Penalización mientras la palabra a medias no inicia ninguna palabra del vocabulario")
+    recognition.add_argument("--phonetic", action=argparse.BooleanOptionalAction,
+                             help="Corregir palabras inexistentes por un homófono real (seseo, b/v, h, ll/y)")
     recognition.add_argument("--min-confidence", type=float, default=0.15)
     recognition.add_argument("--max-segment-seconds", type=float, default=25.0)
     recognition.add_argument("--overlap-seconds", type=float, default=0.4)
@@ -104,13 +117,17 @@ def main():
     evaluation.add_argument("--cache", help="Caché de características creada con cache-features")
     evaluation.add_argument("--beam-width", type=int, default=1)
     evaluation.add_argument("--lm", help="Modelo n-gram creado solo con train")
-    evaluation.add_argument("--lm-weight", type=float, default=0.2)
-    evaluation.add_argument("--word-bonus", type=float, help="Por defecto 1 con --lm y 0 sin modelo de lenguaje")
+    evaluation.add_argument("--lm-weight", type=float)
+    evaluation.add_argument("--word-bonus", type=float)
     evaluation.add_argument("--lm-smoothing", choices=["add-k", "kneser-ney"])
+    evaluation.add_argument("--prefix-penalty", type=float)
+    evaluation.add_argument("--phonetic", action=argparse.BooleanOptionalAction)
     evaluation.add_argument("--workers", type=int, default=0, help="Procesos para el beam search; 0 = la mitad de los núcleos")
     args = parser.parse_args()
-    if getattr(args, "word_bonus", 0) is None:
-        args.word_bonus = 1.0 if args.lm else 0.0
+    # Lo que no se indique toma el valor elegido con tune-decoder en dev (con --lm) o queda apagado (sin --lm).
+    for key, value in (LM_DECODER_DEFAULTS if getattr(args, "lm", None) else NO_LM_DECODER).items():
+        if getattr(args, key, "") is None:
+            setattr(args, key, value)
     if args.command == "diagnose":
         import torch
         from .model import CRNN
@@ -161,7 +178,8 @@ def main():
         result = tune_decoder(args.checkpoint, args.dev, args.lm, args.output, args.cache, args.clips, args.seed,
                               numbers(args.lm_weights), numbers(args.word_bonuses),
                               tuple(value.strip() for value in args.smoothings.split(",") if value.strip()),
-                              args.beam_width, args.workers or max(1, (os.cpu_count() or 2) // 2), args.device)
+                              args.beam_width, args.workers or max(1, (os.cpu_count() or 2) // 2), args.device,
+                              numbers(args.prefix_penalties), args.phonetic_variants)
     elif args.command == "audit":
         partitions = {name: read_manifest(getattr(args, name)) for name in ("train", "dev", "test") if getattr(args, name)}
         result = audit_partitions(partitions)
@@ -171,13 +189,15 @@ def main():
         result = train(args.train, args.dev, args.output, epochs=args.epochs, batch_size=args.batch_size,
                        learning_rate=args.learning_rate, device_name=args.device, seed=args.seed,
                        hidden_size=args.hidden_size, cache_dir=args.cache, workers=workers, resume=args.resume,
-                       augment=args.augment, init_checkpoint=args.init_checkpoint)
+                       augment=args.augment, init_checkpoint=args.init_checkpoint,
+                       lr_schedule=args.lr_schedule, min_lr_factor=args.min_lr_factor)
     elif args.command == "transcribe":
         from .engine import transcribe
         from .vad import VADConfig
         vad = VADConfig(max_segment_seconds=args.max_segment_seconds, overlap_seconds=args.overlap_seconds)
         result = transcribe(args.checkpoint, args.audio, args.device, args.beam_width, args.lm,
-                            args.lm_weight, args.min_confidence, vad, args.word_bonus, args.lm_smoothing)
+                            args.lm_weight, args.min_confidence, vad, args.word_bonus, args.lm_smoothing,
+                            args.prefix_penalty, args.phonetic)
     else:
         from .engine import test_checkpoint
         output = Path(args.output)
@@ -185,7 +205,8 @@ def main():
             raise ValueError("Usa un archivo de evaluación nuevo")
         result = test_checkpoint(args.checkpoint, args.test, args.train, args.dev, args.device, args.cache,
                                  args.beam_width, args.lm, args.lm_weight, args.word_bonus, args.lm_smoothing,
-                                 args.workers or max(1, (os.cpu_count() or 2) // 2))
+                                 args.workers or max(1, (os.cpu_count() or 2) // 2),
+                                 args.prefix_penalty, args.phonetic)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         result = {"metricas": result["metrics"], "resultados": str(output.resolve())}
